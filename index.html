@@ -1,0 +1,309 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Stickers Archive</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+<style>
+  :root{
+    --bg: #0d0f0e;
+    --panel: #161918;
+    --line: #2a2f2c;
+    --text: #eee;
+    --dim: #8a938c;
+    --accent: #25D366; /* WhatsApp Green */
+  }
+  *{ box-sizing: border-box; -webkit-tap-highlight-color: transparent; user-select: none; }
+  body{
+    margin:0; background: var(--bg); color: var(--text);
+    font-family: system-ui, -apple-system, sans-serif; font-size: 14px;
+    padding-bottom: 90px;
+  }
+  header{
+    position: sticky; top:0; z-index: 20; background: rgba(13,15,14,.95); backdrop-filter: blur(6px);
+    padding: 14px 16px; border-bottom: 1px solid var(--line);
+  }
+  header h1{ font-size: 16px; margin: 0 0 10px; font-weight: 600; }
+  .search-row{ display:flex; gap: 8px; }
+  #search{
+    flex:1; background: var(--panel); border:1px solid var(--line); color: var(--text);
+    padding: 10px 12px; border-radius: 8px; font-size: 14px;
+  }
+  #search:focus{ outline: 1px solid var(--accent); }
+  .status{ color: var(--dim); font-size: 12px; margin-top: 8px; }
+
+  .grid{
+    display:grid; grid-template-columns: repeat(auto-fill, minmax(110px, 1fr));
+    gap: 8px; padding: 14px 16px;
+  }
+  .card{
+    position: relative; aspect-ratio: 1; border-radius: 10px; overflow: hidden;
+    border: 2px solid var(--line); background: var(--panel); cursor: pointer;
+  }
+  .card img{ width:100%; height:100%; object-fit: contain; background:#000; pointer-events:none; }
+  .card.selected{ border-color: var(--accent); }
+  .card .check{
+    position:absolute; top:6px; left:6px; width:20px; height:20px; border-radius:5px;
+    background: rgba(0,0,0,.6); border:1px solid #666; display:none;
+    align-items:center; justify-content:center; font-size:12px;
+  }
+  body.selecting .card .check{ display:flex; }
+  .card.selected .check{ background: var(--accent); border-color: var(--accent); color: #000; font-weight: bold;}
+  .card .user{
+    position:absolute; bottom:0; left:0; right:0; padding: 4px 6px;
+    background: linear-gradient(transparent, rgba(0,0,0,.9));
+    font-size: 10px; color: #ccc; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+  }
+
+  .empty{ text-align:center; padding: 60px 20px; color: var(--dim); }
+
+  .tray{
+    position: fixed; left:0; right:0; bottom:0; z-index: 30;
+    background: var(--panel); border-top: 1px solid var(--line);
+    padding: 12px 16px; display: none;
+    align-items:center; gap: 10px; flex-wrap: wrap;
+    box-shadow: 0 -4px 15px rgba(0,0,0,0.5);
+  }
+  body.selecting .tray{ display:flex; }
+  .tray .count{ font-size: 13px; color: var(--dim); margin-right: auto; font-weight: 600;}
+  .tray button{
+    background: var(--bg); color: var(--text); border:1px solid var(--line);
+    padding: 9px 14px; border-radius: 8px; font-size: 13px; font-weight: bold; cursor: pointer;
+  }
+  .tray button.primary{ background: var(--accent); border-color: var(--accent); color:#000; }
+  .tray button.ghost{ color: var(--dim); border-color: transparent; }
+
+  .loading-spinner{ text-align:center; padding: 30px; color: var(--dim); font-size: 13px; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>📦 Sticker Archive</h1>
+  <div class="search-row">
+    <input id="search" placeholder="Search TikTok username (no @)..." autocapitalize="off">
+  </div>
+  <div class="status" id="status">Loading archive from GitHub...</div>
+</header>
+
+<div class="grid" id="grid"></div>
+<div class="loading-spinner" id="spinner" style="display:none;">Loading more...</div>
+<div class="empty" id="emptyMsg" style="display:none;">No stickers found.</div>
+
+<div class="tray">
+  <span class="count" id="selCount">0 selected</span>
+  <button class="ghost" id="clearBtn">Clear</button>
+  <button id="zipBtn">.zip</button>
+  <button class="primary" id="shareBtn">Share to WhatsApp</button>
+</div>
+
+<script>
+// ── CONFIG ────────────────────────────────────────────────────────────────
+const GH_USER = 'Joshkihiu';
+const GH_REPO = 'Tiktokstickers';
+const GH_BRANCH = 'main';
+const STICKERS_PATH = 'stickers';
+
+const RAW_BASE = `https://raw.githubusercontent.com/${GH_USER}/${GH_REPO}/${GH_BRANCH}`;
+const TREE_API = `https://api.github.com/repos/${GH_USER}/${GH_REPO}/git/trees/${GH_BRANCH}?recursive=1`;
+
+let allStickers = []; 
+let selected = new Map(); 
+let renderedCount = 0;
+const PAGE_SIZE = 60;
+
+const grid = document.getElementById('grid');
+const statusEl = document.getElementById('status');
+const searchEl = document.getElementById('search');
+const emptyMsg = document.getElementById('emptyMsg');
+const spinner = document.getElementById('spinner');
+const selCountEl = document.getElementById('selCount');
+
+// Safely encode file paths containing emojis, spaces, or special characters
+function encodeGitPath(path) {
+    return path.split('/').map(encodeURIComponent).join('/');
+}
+
+async function loadIndex(){
+  try{
+    const res = await fetch(TREE_API);
+    if (!res.ok) throw new Error(`GitHub API returned ${res.status}. Repo might be private.`);
+    const data = await res.json();
+    
+    // Filter only images inside the stickers folder
+    allStickers = data.tree
+      .filter(item => item.type === 'blob' && item.path.startsWith(STICKERS_PATH + '/') && /\.(webp|png|jpe?g|gif)$/i.test(item.path))
+      .map(item => {
+        const parts = item.path.split('/'); 
+        return { path: item.path, user: parts[1] || 'unsorted', name: parts[parts.length - 1] };
+      });
+      
+    // Sort newest first
+    allStickers.reverse(); 
+
+    statusEl.textContent = `${allStickers.length} stickers from ${new Set(allStickers.map(s => s.user)).size} users`;
+    renderPage(true);
+  }catch(e){
+    statusEl.textContent = `Couldn't load the archive — ${e.message}`;
+  }
+}
+
+function currentFiltered(){
+  const q = searchEl.value.trim().toLowerCase();
+  if (!q) return allStickers;
+  return allStickers.filter(s => s.user.toLowerCase().includes(q));
+}
+
+function renderPage(reset){
+  if (reset){
+    grid.innerHTML = '';
+    renderedCount = 0;
+  }
+  const filtered = currentFiltered();
+  emptyMsg.style.display = filtered.length === 0 ? 'block' : 'none';
+
+  const slice = filtered.slice(renderedCount, renderedCount + PAGE_SIZE);
+  slice.forEach(s => grid.appendChild(makeCard(s)));
+  renderedCount += slice.length;
+  spinner.style.display = renderedCount < filtered.length ? 'block' : 'none';
+}
+
+function makeCard(sticker){
+  const el = document.createElement('div');
+  el.className = 'card' + (selected.has(sticker.path) ? ' selected' : '');
+  
+  // Apply encoding for special characters in folder names
+  const safeUrl = `${RAW_BASE}/${encodeGitPath(sticker.path)}`;
+
+  el.innerHTML = `
+    <img src="${safeUrl}" loading="lazy" alt="${sticker.name}">
+    <div class="check">✓</div>
+    <div class="user">@${sticker.user}</div>
+  `;
+
+  let pressTimer = null;
+  const LONG_PRESS_MS = 400;
+
+  const startPress = (e) => {
+    if(e.button !== undefined && e.button !== 0) return; 
+    pressTimer = setTimeout(() => {
+      pressTimer = null;
+      document.body.classList.add('selecting');
+      toggleSelect(sticker, el);
+      if (navigator.vibrate) navigator.vibrate(30);
+    }, LONG_PRESS_MS);
+  };
+  
+  const cancelPress = (wasTap) => {
+    if (pressTimer){
+      clearTimeout(pressTimer);
+      pressTimer = null;
+      if (wasTap && document.body.classList.contains('selecting')){
+        toggleSelect(sticker, el);
+      }
+    }
+  };
+
+  el.addEventListener('pointerdown', startPress);
+  el.addEventListener('pointerup', () => cancelPress(true));
+  el.addEventListener('pointerleave', () => cancelPress(false));
+  el.addEventListener('contextmenu', (e) => e.preventDefault()); 
+
+  return el;
+}
+
+function toggleSelect(sticker, el){
+  if (selected.has(sticker.path)){
+    selected.delete(sticker.path);
+    el.classList.remove('selected');
+  } else {
+    selected.set(sticker.path, sticker);
+    el.classList.add('selected');
+  }
+  selCountEl.textContent = `${selected.size} selected`;
+  if (selected.size === 0) document.body.classList.remove('selecting');
+}
+
+document.getElementById('clearBtn').addEventListener('click', () => {
+  selected.clear();
+  document.body.classList.remove('selecting');
+  document.querySelectorAll('.card.selected').forEach(c => c.classList.remove('selected'));
+});
+
+async function fetchAsFile(sticker){
+  const safeUrl = `${RAW_BASE}/${encodeGitPath(sticker.path)}`;
+  const res = await fetch(safeUrl);
+  const blob = await res.blob();
+  return new File([blob], sticker.name, { type: blob.type || 'image/webp' });
+}
+
+document.getElementById('shareBtn').addEventListener('click', async () => {
+  const items = [...selected.values()];
+  if (items.length === 0) return;
+  
+  const originalText = statusEl.textContent;
+  statusEl.textContent = `Preparing ${items.length} sticker(s)...`;
+  
+  try{
+    const files = await Promise.all(items.map(fetchAsFile));
+    if (navigator.canShare && navigator.canShare({ files })){
+      await navigator.share({ files, title: 'Exported Stickers' });
+      statusEl.textContent = 'Opening share menu...';
+      setTimeout(() => { statusEl.textContent = originalText; }, 3000);
+    } else {
+      statusEl.textContent = "Your browser blocks direct sharing. Downloading a .zip instead.";
+      await downloadZip(items);
+    }
+  }catch(e){
+    if (e.name !== 'AbortError') {
+      statusEl.textContent = `Share failed: ${e.message}`;
+    } else {
+      statusEl.textContent = originalText;
+    }
+  }
+});
+
+async function downloadZip(items){
+  statusEl.textContent = "Zipping files...";
+  const zip = new JSZip();
+  for (const s of items){
+    const safeUrl = `${RAW_BASE}/${encodeGitPath(s.path)}`;
+    const res = await fetch(safeUrl);
+    const blob = await res.blob();
+    zip.file(s.name, blob);
+  }
+  const content = await zip.generateAsync({ type: 'blob' });
+  const url = URL.createObjectURL(content);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `stickers-${items.length}.zip`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+  statusEl.textContent = "Download complete.";
+}
+
+document.getElementById('zipBtn').addEventListener('click', () => {
+  const items = [...selected.values()];
+  if (items.length) downloadZip(items);
+});
+
+searchEl.addEventListener('input', () => {
+  renderPage(true);
+  window.scrollTo(0,0);
+});
+
+window.addEventListener('scroll', () => {
+  if (window.innerHeight + window.scrollY >= document.body.offsetHeight - 400){
+    renderPage(false);
+  }
+});
+
+// Start the engine
+loadIndex();
+</script>
+
+</body>
+</html>
