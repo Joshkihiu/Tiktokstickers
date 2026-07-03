@@ -108,6 +108,10 @@ const STICKERS_PATH = 'stickers';
 const RAW_BASE = `https://raw.githubusercontent.com/${GH_USER}/${GH_REPO}/${GH_BRANCH}`;
 const TREE_API = `https://api.github.com/repos/${GH_USER}/${GH_REPO}/git/trees/${GH_BRANCH}?recursive=1`;
 
+// WhatsApp sticker requirements
+const STICKER_SIZE = 512;       // px, must be exactly 512x512
+const STICKER_MAX_BYTES = 100 * 1024; // aim under 100KB (hard cap ~500KB)
+
 let allStickers = []; 
 let selected = new Map(); 
 let renderedCount = 0;
@@ -231,11 +235,74 @@ document.getElementById('clearBtn').addEventListener('click', () => {
   document.querySelectorAll('.card.selected').forEach(c => c.classList.remove('selected'));
 });
 
-async function fetchAsFile(sticker){
+// ── STICKER CONVERSION ──────────────────────────────────────────────────
+// Loads an image blob, draws it centered/contained on a transparent 512x512
+// canvas, then re-encodes as WebP, compressing quality down until the file
+// fits under STICKER_MAX_BYTES (WhatsApp's sticker size requirements).
+function loadImageBitmapSafe(blob){
+  if (window.createImageBitmap){
+    return createImageBitmap(blob).catch(() => loadImageEl(blob));
+  }
+  return loadImageEl(blob);
+}
+
+function loadImageEl(blob){
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(blob);
+    const img = new Image();
+    img.onload = () => { resolve(img); };
+    img.onerror = (e) => { URL.revokeObjectURL(url); reject(e); };
+    img.src = url;
+  });
+}
+
+async function canvasToBlob(canvas, type, quality){
+  return new Promise(resolve => canvas.toBlob(resolve, type, quality));
+}
+
+async function convertToStickerWebp(blob, name){
+  const img = await loadImageBitmapSafe(blob);
+  const srcW = img.width, srcH = img.height;
+
+  const canvas = document.createElement('canvas');
+  canvas.width = STICKER_SIZE;
+  canvas.height = STICKER_SIZE;
+  const ctx = canvas.getContext('2d');
+  ctx.clearRect(0, 0, STICKER_SIZE, STICKER_SIZE); // keep transparent bg
+
+  // Contain-fit: scale image to fit inside 512x512 without cropping,
+  // centered, preserving transparency and aspect ratio.
+  const scale = Math.min(STICKER_SIZE / srcW, STICKER_SIZE / srcH);
+  const drawW = srcW * scale;
+  const drawH = srcH * scale;
+  const dx = (STICKER_SIZE - drawW) / 2;
+  const dy = (STICKER_SIZE - drawH) / 2;
+  ctx.drawImage(img, dx, dy, drawW, drawH);
+
+  if (img.close) img.close(); // free ImageBitmap memory if applicable
+
+  // Try progressively lower quality until under size cap, or bail at a floor.
+  let quality = 0.9;
+  let outBlob = await canvasToBlob(canvas, 'image/webp', quality);
+
+  while (outBlob && outBlob.size > STICKER_MAX_BYTES && quality > 0.3){
+    quality -= 0.15;
+    outBlob = await canvasToBlob(canvas, 'image/webp', quality);
+  }
+
+  if (!outBlob){
+    throw new Error('This browser cannot encode WebP (try Chrome or Safari).');
+  }
+
+  const outName = name.replace(/\.[^.]+$/, '') + '.webp';
+  return new File([outBlob], outName, { type: 'image/webp' });
+}
+
+async function fetchAsStickerFile(sticker){
   const safeUrl = `${RAW_BASE}/${encodeGitPath(sticker.path)}`;
   const res = await fetch(safeUrl);
   const blob = await res.blob();
-  return new File([blob], sticker.name, { type: blob.type || 'image/webp' });
+  return convertToStickerWebp(blob, sticker.name);
 }
 
 document.getElementById('shareBtn').addEventListener('click', async () => {
@@ -243,17 +310,20 @@ document.getElementById('shareBtn').addEventListener('click', async () => {
   if (items.length === 0) return;
   
   const originalText = statusEl.textContent;
-  statusEl.textContent = `Preparing ${items.length} sticker(s)...`;
+  statusEl.textContent = `Converting ${items.length} sticker(s)...`;
   
   try{
-    const files = await Promise.all(items.map(fetchAsFile));
+    const files = [];
+    for (const item of items){
+      files.push(await fetchAsStickerFile(item));
+    }
     if (navigator.canShare && navigator.canShare({ files })){
-      await navigator.share({ files, title: 'Exported Stickers' });
       statusEl.textContent = 'Opening share menu...';
+      await navigator.share({ files, title: 'Exported Stickers' });
       setTimeout(() => { statusEl.textContent = originalText; }, 3000);
     } else {
       statusEl.textContent = "Your browser blocks direct sharing. Downloading a .zip instead.";
-      await downloadZip(items);
+      await downloadZipFiles(files);
     }
   }catch(e){
     if (e.name !== 'AbortError') {
@@ -264,20 +334,17 @@ document.getElementById('shareBtn').addEventListener('click', async () => {
   }
 });
 
-async function downloadZip(items){
+async function downloadZipFiles(files){
   statusEl.textContent = "Zipping files...";
   const zip = new JSZip();
-  for (const s of items){
-    const safeUrl = `${RAW_BASE}/${encodeGitPath(s.path)}`;
-    const res = await fetch(safeUrl);
-    const blob = await res.blob();
-    zip.file(s.name, blob);
+  for (const f of files){
+    zip.file(f.name, f);
   }
   const content = await zip.generateAsync({ type: 'blob' });
   const url = URL.createObjectURL(content);
   const a = document.createElement('a');
   a.href = url;
-  a.download = `stickers-${items.length}.zip`;
+  a.download = `stickers-${files.length}.zip`;
   document.body.appendChild(a);
   a.click();
   a.remove();
@@ -285,9 +352,20 @@ async function downloadZip(items){
   statusEl.textContent = "Download complete.";
 }
 
-document.getElementById('zipBtn').addEventListener('click', () => {
+document.getElementById('zipBtn').addEventListener('click', async () => {
   const items = [...selected.values()];
-  if (items.length) downloadZip(items);
+  if (!items.length) return;
+  const originalText = statusEl.textContent;
+  statusEl.textContent = `Converting ${items.length} sticker(s)...`;
+  try{
+    const files = [];
+    for (const item of items){
+      files.push(await fetchAsStickerFile(item));
+    }
+    await downloadZipFiles(files);
+  }catch(e){
+    statusEl.textContent = `Zip failed: ${e.message}`;
+  }
 });
 
 searchEl.addEventListener('input', () => {
